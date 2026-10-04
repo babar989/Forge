@@ -1,0 +1,208 @@
+name: forge-web
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: forge-web-postgres
+    restart: unless-stopped
+    # Dev only — bound to loopback; do not expose on a public host
+    ports:
+      - "127.0.0.1:${FORGE_WEB_POSTGRES_PORT:-5434}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-forge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forge}
+      POSTGRES_DB: ${POSTGRES_DB:-rodium_forge}
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    volumes:
+      - forge_web_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forge} -d ${POSTGRES_DB:-rodium_forge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: forge-web-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-rodiumdev}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-rodiumdev123}
+      MINIO_SERVER_URL: http://localhost:9000
+      MINIO_BROWSER_REDIRECT_URL: http://localhost:9001
+    # Dev only — bound to loopback; do not expose on a public host
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - forge_web_minio_data:/data
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: forge-web-minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-rodiumdev}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-rodiumdev123}
+    volumes:
+      - ./infra/local/minio-init.sh:/init.sh:ro
+    entrypoint: ["/bin/sh", "/init.sh"]
+    restart: "no"
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: forge-web-valkey
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD:-forge-dev-valkey}
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --requirepass
+      - ${VALKEY_PASSWORD:-forge-dev-valkey}
+    # Localhost-only: do not expose an unauthenticated (or weak) Redis to the LAN.
+    ports:
+      - "127.0.0.1:${FORGE_WEB_VALKEY_PORT:-6380}:6379"
+    volumes:
+      - forge_web_valkey_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a \"$$VALKEY_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: forge-web-api
+    restart: unless-stopped
+    ports:
+      - "${FORGE_WEB_API_PORT:-8100}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge}@postgres:5432/${POSTGRES_DB:-rodium_forge}
+      PROJECTS_ROOT: /data/projects
+      CORS_ORIGINS: http://localhost:3100,http://127.0.0.1:3100,http://localhost:8080
+      OBJECT_STORE_ENDPOINT: http://minio:9000
+      OBJECT_STORE_PUBLIC_ENDPOINT: http://localhost:9000
+      OBJECT_STORE_ACCESS_KEY: ${MINIO_ROOT_USER:-rodiumdev}
+      OBJECT_STORE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-rodiumdev123}
+      OBJECT_STORE_ADDRESSING: path
+      REDIS_URL: redis://:${VALKEY_PASSWORD:-forge-dev-valkey}@valkey:6379/0
+      # Prefer 127.0.0.1: on Windows, localhost often resolves to ::1 and the
+      # browser iframe fails while fetch via 127.0.0.1 still works.
+      API_BASE_URL: http://127.0.0.1:8100
+      # Origin used to build the links we email out (verify, reset).
+      WEB_APP_URL: ${WEB_APP_URL:-http://localhost:3100}
+      # `mailpit` resolves on the compose network; the host port is only for
+      # the web UI. Same transport the platform API uses in development.
+      MAIL_TRANSPORT: ${MAIL_TRANSPORT:-smtp}
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      TEMPLATES_ROOT: /data/templates
+      INTEGRATIONS_ROOT: /data/integrations
+      RUNNER_PARENT_ORIGINS: http://localhost:3100,http://127.0.0.1:3100
+      SSE_HEARTBEAT_SECONDS: "15"
+      ALB_IDLE_TIMEOUT_SECONDS: "600"
+    volumes:
+      - ./data/projects:/data/projects
+      - ./data/templates:/data/templates:ro
+      - ./data/integrations:/data/integrations:ro
+      - ./infra/local:/srv/infra:ro
+      # Live-reload API sources while iterating on visual-edit / bridge.
+      - ./apps/api/app:/app/app
+      - ./apps/api/runtime/public:/app/runtime/public
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8100}
+        # Next inlines NEXT_PUBLIC_* at build time, so these have to be build
+        # args — setting them only under `environment` would leave the bundle
+        # with empty values and the social buttons permanently hidden.
+        NEXT_PUBLIC_FIREBASE_API_KEY: ${NEXT_PUBLIC_FIREBASE_API_KEY:-}
+        NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: ${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN:-}
+        NEXT_PUBLIC_FIREBASE_PROJECT_ID: ${NEXT_PUBLIC_FIREBASE_PROJECT_ID:-}
+        NEXT_PUBLIC_FIREBASE_APP_ID: ${NEXT_PUBLIC_FIREBASE_APP_ID:-}
+    container_name: forge-web-ui
+    restart: unless-stopped
+    ports:
+      - "${FORGE_WEB_UI_PORT:-3100}:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8100}
+      DOCKER_BUILD: "1"
+      FORGE_FONT_MODE: fallback
+    depends_on:
+      - api
+
+  # Catches every outbound mail and shows it at http://localhost:8026.
+  # Ships with the stack so a fresh clone can complete email verification and
+  # password reset without owning a mail provider — the flows are real, only
+  # the delivery is local.
+  #
+  # Mailpit rather than MailHog: MailHog's last release was 2020 and its
+  # AngularJS preview fails to render multipart/alternative messages, showing
+  # its own `{{preview.previewHTML}}` template expression instead of the mail.
+  # Mailpit is the maintained drop-in — same SMTP port, same job.
+  mailpit:
+    image: axllent/mailpit:v1.21
+    container_name: forge-web-mailpit
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    # Dev only — bound to loopback; do not expose on a public host
+    ports:
+      - "127.0.0.1:${FORGE_WEB_MAILPIT_SMTP_PORT:-1026}:1025"
+      - "127.0.0.1:${FORGE_WEB_MAILPIT_UI_PORT:-8026}:8025"
+
+  caddy:
+    image: caddy:2.9-alpine
+    container_name: forge-web-caddy
+    depends_on:
+      - api
+      - minio
+    volumes:
+      - ./infra/local/Caddyfile:/etc/caddy/Caddyfile:ro
+      - forge_web_caddy_data:/data
+    ports:
+      - "${FORGE_WEB_CADDY_PORT:-8080}:80"
+
+  adminer:
+    image: adminer:4
+    container_name: forge-web-adminer
+    restart: unless-stopped
+    # Dev only — bound to loopback; do not expose on a public host
+    ports:
+      - "127.0.0.1:${FORGE_WEB_ADMINER_PORT:-8089}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  forge_web_pg_data:
+  forge_web_minio_data:
+  forge_web_valkey_data:
+  forge_web_caddy_data:
